@@ -1,0 +1,11 @@
+{
+  "name": "art-of-living-africa-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare-content": "node tools/import-standalone.mjs",
+    "preview": "node tools/preview.mjs",
+    "test": "node tests/integration.mjs"
+  },
+  "dependencies": { "@php-wasm/node": "3.1.57", "parse5": "8.0.0" }
+}
