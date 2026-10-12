@@ -1,0 +1,158 @@
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const serializeMap = map => JSON.stringify(Object.fromEntries(Object.entries(map).sort(([a],[b])=>a.localeCompare(b))));
+const state={user:null,csrf:'',local:false,pages:[],media:[],page:null,patches:{},saved:'',selected:null,dirty:false,view:'overview',device:'desktop'};
+let toastTimer, searchTimer;
+function toast(message,error=false){$('#toast').textContent=message;$('#toast').className=`toast${error?' error':''}`;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,error?9000:4500);}
+async function api(action,data,params={}){
+  const qs=new URLSearchParams({action,...params});const headers={};const options={headers,credentials:'same-origin'};
+  if(data!==undefined){options.method='POST';headers['X-CSRF-Token']=state.csrf;if(data instanceof FormData)options.body=data;else{headers['Content-Type']='application/json';options.body=JSON.stringify(data);}}
+  const response=await fetch(`../api.php?${qs}`,options);const result=await response.json().catch(()=>({error:'Unexpected server response. Check the hosting configuration.'}));
+  if(!response.ok){if(response.status===401 && !['login','setup'].includes(action)) setTimeout(boot,0);throw new Error(result.error || 'Request failed.');}return result;
+}
+async function guarded(task){try{await task();}catch(e){toast(e.message,true);}}
+function date(value){return value?new Date(value).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}):'Original website content';}
+async function confirmAction(title,copy,button='Confirm',details=''){
+  const d=$('#confirm-dialog');$('#confirm-title').textContent=title;$('#confirm-copy').textContent=copy;$('#confirm-button').textContent=button;$('#confirm-details').innerHTML=details;d.showModal();
+  return new Promise(resolve=>d.addEventListener('close',()=>resolve(d.returnValue==='confirm'),{once:true}));
+}
+async function boot(){
+  const result=await api('status');Object.assign(state,{user:result.user,csrf:result.csrf,local:result.local});
+  $('#app').hidden=!state.user;$('#auth').hidden=!!state.user;
+  if(!state.user){
+    const setup=result.setupRequired && result.setupEnabled;
+    $('#auth-title').textContent=setup?'Set up your workspace.':'Welcome back.';$('#setup-fields').hidden=!setup;$('#auth-submit').textContent=setup?'Create administrator →':'Sign in →';
+    $('#auth-form').dataset.action=setup?'setup':'login';$('#local-enter').hidden=!state.local;
+    $('#auth-description').textContent=setup?'Create the first administrator. Your hosting operator supplies the one-time installation token.':'Sign in to update the website. No code required.';
+    if(state.local){$('#auth-description').textContent='This workspace saves changes on this computer only. It is not connected to the live website.';$('#auth-form').hidden=true;$('#auth-note').textContent='No client credentials are used in local preview.';}
+    else if(result.setupRequired&&!result.setupEnabled){$('#auth-form').hidden=true;$('#auth-note').textContent='Ask Derrick to configure the one-time installation token. The dashboard does not have a default password.';}
+    else $('#auth-form').hidden=false;
+    return;
+  }
+  $('#user-name').textContent=state.user.name;$('#avatar').textContent=state.user.name[0];$('#user-role').textContent=state.user.role==='admin'?'Administrator':'Content editor';$('#team-nav').hidden=state.user.role!=='admin';
+  $('#environment').textContent=state.local?'Local • not deployed':'Connected website';$('#environment').classList.toggle('local',state.local);
+  await refreshPages();await route();
+}
+async function refreshPages(){state.pages=(await api('pages')).pages;}
+function pageCard(p){return `<a class="page-card" href="#edit=${encodeURIComponent(p.slug)}"><div class="image"><img src="../${esc(p.hero)}" alt="" loading="lazy"></div><div class="card-body"><div class="card-meta"><span>${esc(p.category)}</span><span class="badge${p.dirty?' draft':''}">${p.dirty?'Draft saved':'Published content'}</span></div><h3>${esc(p.title)}</h3><p>${p.fields} editable fields · ${esc(p.slug)}</p></div><div class="card-foot"><span>Edit page</span><span aria-hidden="true">↗</span></div></a>`;}
+function head(eyebrow,title,copy,actions=''){return `<div class="page-head"><div><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p>${copy}</p></div>${actions}</div>`;}
+function localNotice(){return state.local?'<div class="notice"><span class="symbol" aria-hidden="true">◎</span><div><strong>Your local editing workspace</strong><p>Saves and publishes affect this copy only. The live website and Google Drive are untouched. Derrick must install and connect this dashboard before Nimo can use it online.</p></div></div>':'';}
+async function route(){
+  if(!state.user)return;
+  const hash=location.hash.slice(1)||'overview';const next=hash.startsWith('edit=')?'edit':hash;
+  if(state.dirty && (!hash.startsWith('edit=') || decodeURIComponent(hash.slice(5))!==state.page?.slug)){
+    if(!await confirmAction('Leave unsaved changes?','These edits have not been saved to the server. Stay on this page to save them.','Leave without saving')){history.replaceState(null,'',`#edit=${encodeURIComponent(state.page.slug)}`);return;}
+    state.dirty=false;
+  }
+  state.view=next;window.scrollTo(0,0);document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active',a.dataset.view===next || (next==='edit' && a.dataset.view==='pages')));
+  const names={overview:'Overview',pages:'Website pages',media:'Media library',history:'Revision history',team:'Team & access',help:'Help & handover',edit:'Website pages / Edit'};$('#breadcrumb').textContent=names[next]||'Overview';
+  $('#content').innerHTML='<div class="loading" role="status">Loading your workspace…</div>';
+  try{
+    if(next==='edit'){await editor(decodeURIComponent(hash.slice(5)));return;}
+    if(next==='pages'){pagesView();return;}
+    if(next==='media'){await mediaView();return;}
+    if(next==='history'){await historyView();return;}
+    if(next==='team'){await teamView();return;}
+    if(next==='help'){helpView();return;}
+    overview();
+  }catch(e){$('#content').innerHTML=`<div class="empty"><h3>Could not load this view</h3><p>${esc(e.message)}</p><button id="retry" class="secondary">Try again</button></div>`;$('#retry').onclick=()=>guarded(route);}
+}
+function overview(){
+  const drafts=state.pages.filter(p=>p.dirty),countries=state.pages.filter(p=>p.category==='Countries' && p.slug!=='country-contacts.html');
+  $('#content').innerHTML=head('YOUR AFRICA-WIDE WEBSITE','Keep the story current.','Update the words, photographs and programme details behind Africa’s impact.',state.user.role==='admin'?'<button id="publish-all" class="primary">Review saved drafts →</button>':'<a class="primary" href="#pages">Edit a website page →</a>')+localNotice()+`<div class="summary-grid"><div class="summary"><b>${state.pages.length}</b><div><strong>Website pages</strong><small>All existing content imported</small></div></div><div class="summary"><b>${drafts.length}</b><div><strong>Saved drafts</strong><small>Ready for administrator review</small></div></div><div class="summary"><b>${countries.length}</b><div><strong>Country profiles</strong><small>Plus the Africa contact directory</small></div></div></div><div class="section-heading"><h2>${drafts.length?'Continue where you left off':'Start with the essentials'}</h2><a href="#pages">View all pages →</a></div><div class="page-grid">${(drafts.length?drafts:state.pages.filter(p=>['index.html','impact.html','country-contacts.html','news-media.html','project-prison-program.html','documentary.html'].includes(p.slug))).slice(0,6).map(pageCard).join('')}</div><div class="help-grid mt"><div class="help-card"><h2>A clear review process.</h2><p>Save drafts without changing the published website. Administrators preview and publish approved changes. Every save is recorded, and earlier versions can be restored as drafts.</p><a class="secondary" href="#history">Browse revision history →</a></div><div class="help-card"><h2>Figures need context.</h2><p>Programme attendances are not automatically unique people. Edit the numerical fields and their source wording together. This dashboard does not invent or automatically combine impact totals.</p><a class="secondary" href="#edit=impact.html">Review impact page →</a></div></div>`;
+  $('#publish-all')?.addEventListener('click',()=>guarded(publishAll));
+}
+async function publishAll(){
+  await refreshPages();const drafts=state.pages.filter(p=>p.dirty);
+  if(!drafts.length){toast('No saved drafts to publish.');return;}
+  if(!await confirmAction('Publish these saved drafts?',`This updates ${drafts.length} page${drafts.length===1?'':'s'} on the ${state.local?'local copy':'connected website'}. Review their previews first. Changes are recorded in revision history.`,'Publish drafts',`<ul>${drafts.map(p=>`<li>${esc(p.title)}</li>`).join('')}</ul>`))return;
+  await api('publish-many',{versions:Object.fromEntries(drafts.map(p=>[p.slug,p.version]))});await refreshPages();overview();toast(state.local?'Published to the local website only.':'Saved drafts published.');
+}
+function pagesView(){
+  $('#content').innerHTML=head('CONTENT, NOT CODE','Website pages.','Choose a page. Click content in its preview to change it.')+`<div class="filters"><input id="page-search" type="search" aria-label="Search pages" placeholder="Search pages, countries or programmes…"><select id="page-category" aria-label="Page category"><option value="">All categories</option>${[...new Set(state.pages.map(p=>p.category))].map(c=>`<option>${esc(c)}</option>`).join('')}</select><select id="page-status" aria-label="Page status"><option value="">All pages</option><option value="draft">Saved drafts</option></select></div><p class="fine" id="page-count"></p><div id="page-results" class="page-grid"></div>`;
+  const draw=()=>{const q=$('#page-search').value.toLowerCase(),cat=$('#page-category').value;const results=state.pages.filter(p=>(!cat||p.category===cat)&&(!$('#page-status').value||p.dirty)&&`${p.title} ${p.slug}`.toLowerCase().includes(q));$('#page-count').textContent=`${results.length} pages`;$('#page-results').innerHTML=results.length?results.map(pageCard).join(''):'<div class="empty"><h3>No matching pages</h3><p>Try another search or category.</p></div>';};
+  ['#page-search','#page-category','#page-status'].forEach(id=>$(id).addEventListener('input',draw));draw();
+}
+function fieldValue(f){return Object.hasOwn(state.patches,f.id)?state.patches[f.id]:f.value;}
+function updateDirty(){state.dirty=serializeMap(state.patches)!==state.saved;const ps=state.page.state;$('#save-state').textContent=state.dirty?'Unsaved changes — save your draft':serializeMap(ps.draft)!==serializeMap(ps.published)?`Draft saved · ${date(ps.updatedAt)}`:'Published version · no unsaved changes';$('#save-page').disabled=!state.dirty;$('#publish-page')?.setAttribute('aria-disabled',String(state.dirty));}
+async function editor(slug){
+  const p=await api('page',undefined,{page:slug});state.page=p;state.patches={...p.state.draft};state.saved=serializeMap(state.patches);state.dirty=false;state.selected=null;
+  $('#content').innerHTML=`<div class="editor-header"><div><a class="back" href="#pages">← All website pages</a><h1>${esc(p.title)}</h1><span id="save-state" class="save-state"></span></div><div class="editor-actions"><button id="preview-page" class="secondary">Preview draft ↗</button><button id="save-page" class="secondary">Save draft</button>${state.user.role==='admin'?'<button id="publish-page" class="primary">Review & publish →</button>':''}</div></div><div class="panel-tabs"><button id="show-fields" class="secondary">Edit fields</button><button id="show-preview" class="secondary">Website preview</button></div><div class="editor-layout"><section class="editor-panel" id="editor-panel" aria-label="Editable fields"><div class="panel-heading"><h2>Page content</h2><small>${p.fields.length} fields</small></div><div class="panel-body"><div id="field-form"><p class="field-hint">Click text or an image in the preview, or choose a field below. Layout and styling stay intact.</p></div><input id="field-search" class="field-search" type="search" placeholder="Find text, images or figures…" aria-label="Search editable fields"><div id="field-list" class="field-list"></div></div></section><section class="preview-shell" id="preview-panel" aria-label="Website editor preview"><div class="preview-tools"><span>Click content to edit</span><div class="device-buttons"><button data-device="desktop" class="active">Desktop</button><button data-device="mobile">Mobile</button></div></div><div class="preview-stage" id="preview-stage"><iframe id="site-preview" title="Editable website preview" src="../index.php?page=${encodeURIComponent(slug)}&edit=1" sandbox="allow-scripts allow-same-origin"></iframe></div></section></div><p class="fine mt">${state.local?'Publishing updates only the local copy.':'Publishing updates the connected website.'} An edit affects this page only; matching wording on other pages must be reviewed separately. New sections and automated workshop totals require an additional content model.</p>`;
+  $('#save-page').onclick=()=>guarded(savePage);$('#publish-page')?.addEventListener('click',()=>guarded(publishPage));$('#preview-page').onclick=()=>{if(state.dirty){toast('Save your draft before opening its preview.',true);return;}window.open(`../index.php?page=${encodeURIComponent(slug)}&preview=1`,'_blank','noopener');};
+  $('#field-search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(drawFields,100);};
+  document.querySelectorAll('[data-device]').forEach(b=>b.onclick=()=>{state.device=b.dataset.device;$('#preview-stage').classList.toggle('mobile',state.device==='mobile');document.querySelectorAll('[data-device]').forEach(x=>x.classList.toggle('active',x===b));});
+  $('#show-fields').onclick=()=>{$('#editor-panel').hidden=false;$('#preview-panel').hidden=true;};$('#show-preview').onclick=()=>{$('#editor-panel').hidden=true;$('#preview-panel').hidden=false;};
+  if(window.innerWidth<=650)$('#preview-panel').hidden=true;
+  drawFields();updateDirty();
+}
+function drawFields(){
+  const q=$('#field-search')?.value.toLowerCase()||'';const fields=state.page.fields.filter(f=>`${fieldValue(f)} ${f.label} ${f.section}`.toLowerCase().includes(q));
+  $('#field-list').innerHTML=fields.length?fields.map(f=>`<button class="field-item${Object.hasOwn(state.patches,f.id)?' changed':''}${state.selected===f.id?' selected':''}" data-field="${esc(f.id)}"><small>${esc(f.label)} · ${esc(f.section).slice(0,60)}</small><strong>${esc(fieldValue(f)||'Empty image description')}</strong></button>`).join(''):'<p class="fine">No fields match that search.</p>';
+  document.querySelectorAll('[data-field]').forEach(b=>b.onclick=()=>selectField(b.dataset.field));
+}
+function selectField(id){
+  const field=state.page.fields.find(f=>f.id===id);if(!field)return;state.selected=id;const v=fieldValue(field);
+  let control=field.kind==='text'?`<textarea id="field-value" rows="${v.length>200?7:3}">${esc(v)}</textarea>`:`<input id="field-value" type="${field.kind==='number'?'number':'text'}" value="${esc(v)}"${field.kind==='number'?' min="0" step="1"':''}>`;
+  const sameNode=state.page.fields.filter(f=>f.node===field.node&&f.id!==field.id);
+  $('#field-form').innerHTML=`<h3 class="selected-title">${esc(field.label)}</h3><p class="selected-section">${esc(field.section)}</p>${field.kind==='image'?`<img class="field-preview" src="../${esc(v)}" alt=""><button id="choose-media" class="secondary wide">Choose from media library</button><p class="fine">Use a library image or a full HTTPS image address.</p>`:''}<label>${field.kind==='number'?'Animated counter target':field.label}${control}</label>${field.kind==='video'?'<p class="fine">For embedded players, use a YouTube or Vimeo embed address. Existing hosted video paths remain supported.</p>':''}${field.attribute==='data-count'?'<p class="field-hint">Also check the visible label and source wording. This is not an automatic unique-person total.</p>':''}<div class="flex"><button id="reset-field" class="quiet">Reset to original</button></div>${sameNode.length?`<p class="fine">Related fields</p>${sameNode.map(f=>`<button class="secondary wide" data-related="${esc(f.id)}">${esc(f.label)}</button>`).join('')}`:''}`;
+  $('#field-value').oninput=e=>{patchField(field,e.target.value);};$('#reset-field').onclick=()=>{patchField(field,field.value);selectField(id);};$('#choose-media')?.addEventListener('click',()=>guarded(()=>chooseMedia(field)));
+  document.querySelectorAll('[data-related]').forEach(b=>b.onclick=()=>selectField(b.dataset.related));drawFields();$('.panel-body').scrollTop=0;
+  if(window.innerWidth<=650){$('#editor-panel').hidden=false;$('#preview-panel').hidden=true;}
+}
+function patchField(field,value){
+  if(value===field.value)delete state.patches[field.id];else state.patches[field.id]=value;
+  $('#site-preview')?.contentWindow.postMessage({type:'AOL_PATCH',fields:[{...field,value}]},location.origin);updateDirty();
+  const selected=$(`[data-field="${CSS.escape(field.id)}"]`);selected?.classList.toggle('changed',Object.hasOwn(state.patches,field.id));selected?.querySelector('strong')?.replaceChildren(document.createTextNode(value||'Empty image description'));
+}
+async function savePage(){
+  const button=$('#save-page');button.disabled=true;button.textContent='Saving…';
+  try{const result=await api('save',{page:state.page.slug,version:state.page.state.version,patches:state.patches});state.page.state=result.state;state.patches={...result.state.draft};state.saved=serializeMap(state.patches);state.dirty=false;await refreshPages();updateDirty();toast('Draft saved on the server. Published content is unchanged.');}
+  finally{button.textContent='Save draft';button.disabled=!state.dirty;}
+}
+async function publishPage(){
+  if(state.dirty){toast('Save your draft before publishing.',true);return;}
+  const old=state.page.state.published;const changed=state.page.fields.filter(f=>(old[f.id]??f.value)!==fieldValue(f));
+  if(!changed.length){toast('No unpublished changes on this page.');return;}
+  const detail=`<ul>${changed.slice(0,12).map(f=>`<li><strong>${esc(f.label)}:</strong> ${esc(fieldValue(f)).slice(0,180)}</li>`).join('')}</ul>${changed.length>12?`<p>Plus ${changed.length-12} other fields.</p>`:''}`;
+  if(!await confirmAction('Publish this page?',`Update “${state.page.title}” on the ${state.local?'local copy only':'connected website'}. The earlier version remains in history.`,'Publish page',detail))return;
+  const result=await api('publish',{page:state.page.slug,version:state.page.state.version});state.page.state=result.state;await refreshPages();updateDirty();toast(state.local?'Page published to local website only.':'Page published.');
+}
+async function chooseMedia(field){
+  state.media=(await api('media')).media;const dialog=$('#media-dialog');$('#media-search').value='';
+  const draw=()=>{const q=$('#media-search').value.toLowerCase();const items=state.media.filter(m=>`${m.name} ${m.alt}`.toLowerCase().includes(q));$('#media-picker').innerHTML=items.map(m=>mediaCard(m,true)).join('')||'<div class="empty">No matching images.</div>';$('#media-picker').querySelectorAll('[data-media]').forEach(b=>b.onclick=()=>{const m=state.media.find(x=>x.id===b.dataset.media);patchField(field,m.path);const alt=state.page.fields.find(f=>f.node===field.node&&f.attribute==='alt');if(alt&&m.alt)patchField(alt,m.alt);dialog.close();selectField(field.id);});};
+  $('#media-search').oninput=draw;draw();dialog.showModal();
+}
+function mediaCard(m,select=false){return `<${select?'button':'article'} class="media-card"${select?` data-media="${esc(m.id)}"`:''}><img src="../${esc(m.path)}" alt="${esc(m.alt)}" loading="lazy"><div><strong>${esc(m.name)}</strong><small>${m.original?'Existing site asset':`Uploaded ${esc(date(m.at))}`}</small></div></${select?'button':'article'}>`;}
+async function mediaView(){
+  state.media=(await api('media')).media;
+  $('#content').innerHTML=head('PHOTOGRAPHS & RIGHTS','Media library.','Reuse the existing website images or upload approved photographs.')+`<div class="upload-box"><h2>Add an approved image</h2><p>JPG, PNG or WebP · up to 20 MB. Videos should use approved YouTube/Vimeo links or the existing hosted files.</p><form id="upload-form" class="upload-form"><label>Image file<input name="file" type="file" accept="image/jpeg,image/png,image/webp" required></label><label>Image description<input name="alt" placeholder="Describe what the image shows" required maxlength="1000"></label><label>Photographer / credit<input name="credit" placeholder="Credit or source owner" required maxlength="500"></label><div class="upload-bottom"><label class="check"><input name="consent" type="checkbox" value="yes" required><span>I confirm permission to publish, including consent and safeguarding checks for identifiable children or other vulnerable participants.</span></label><button type="submit" class="primary">Upload image →</button></div></form></div><div class="section-heading"><h2>Website images</h2><small class="muted">${state.media.length} images</small></div><div class="filters"><input id="library-search" type="search" placeholder="Search image names or countries…" aria-label="Search media library"></div><div id="library-results" class="media-grid"></div>`;
+  const draw=()=>{const q=$('#library-search').value.toLowerCase();$('#library-results').innerHTML=state.media.filter(m=>`${m.name} ${m.alt}`.toLowerCase().includes(q)).map(m=>mediaCard(m)).join('')||'<div class="empty">No matching images.</div>';};$('#library-search').oninput=draw;draw();
+  $('#upload-form').onsubmit=e=>{e.preventDefault();guarded(async()=>{const form=e.target,button=form.querySelector('button');button.disabled=true;button.textContent='Uploading…';try{const result=await api('upload',new FormData(form));state.media.unshift(result.media);form.reset();draw();toast('Image saved. Choose it from an image field to use it on a page.');}finally{button.disabled=false;button.textContent='Upload image →';}});};
+}
+async function historyView(){
+  const entries=(await api('history')).history;
+  $('#content').innerHTML=head('CHANGES YOU CAN TRACE','Revision history.','Every draft and publication is recorded. Restoring creates a draft, never an immediate public change.')+`<div class="filters"><select id="history-page" aria-label="Filter revisions by page"><option value="">All pages</option>${state.pages.map(p=>`<option value="${esc(p.slug)}">${esc(p.title)}</option>`).join('')}</select></div><div id="history-results"></div>`;
+  const draw=()=>{const items=entries.filter(r=>!$('#history-page').value||r.page===$('#history-page').value);$('#history-results').innerHTML=items.length?`<div class="table-wrap"><table><thead><tr><th>Page</th><th>Change</th><th>Editor</th><th>When</th><th>Recover</th></tr></thead><tbody>${items.map(r=>`<tr><td>${esc(state.pages.find(p=>p.slug===r.page)?.title||r.page)}<small>Version ${r.version}</small></td><td>${esc(({save:'Draft saved',publish:'Published',restore:'Restored as draft',discard:'Draft discarded'})[r.action]||r.action)}</td><td>${esc(r.actor)}</td><td>${esc(date(r.at))}</td><td><button class="secondary" data-restore="${esc(r.id)}">Restore draft</button></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty"><h3>No revisions yet</h3><p>Your first saved edit will appear here. The imported website remains the starting version.</p><a href="#pages" class="secondary">Choose a page →</a></div>';document.querySelectorAll('[data-restore]').forEach(b=>b.onclick=()=>guarded(async()=>{const r=entries.find(x=>x.id===b.dataset.restore);if(!await confirmAction('Restore this version as a draft?',`Load the saved content of “${r.page}” from ${date(r.at)}. The published page stays unchanged.`,'Restore draft'))return;const p=await api('page',undefined,{page:r.page});await api('restore',{page:r.page,version:p.state.version,revision:r.id});await refreshPages();location.hash=`edit=${encodeURIComponent(r.page)}`;toast('Earlier content restored as a draft. Review before publishing.');}));};$('#history-page').onchange=draw;draw();
+}
+async function teamView(){
+  const users=(await api('users')).users;
+  $('#content').innerHTML=head('WHO CAN UPDATE WHAT','Team & access.','Editors save drafts and upload media. Administrators can also publish, restore, and manage access.')+`<div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Access</th><th></th></tr></thead><tbody>${users.length?users.map(u=>`<tr><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${u.active?'Active':'Disabled'}</td><td>${u.id!==state.user.id?`<button class="secondary" data-user="${esc(u.id)}">${u.active?'Disable':'Enable'}</button>`:''}</td></tr>`).join(''):'<tr><td colspan="5">Local preview has no production user accounts. Create the real administrator during installation.</td></tr>'}</tbody></table></div><div class="help-grid mt"><div class="help-card"><h2>Create a team account</h2><p>Share credentials securely. This does not send an invitation email.</p><form id="user-form"><label>Name<input name="name" required maxlength="100" autocomplete="off"></label><label>Email<input name="email" type="email" required autocomplete="off"></label><label>Role<select name="role"><option value="editor">Editor — draft only</option><option value="admin">Administrator — may publish</option></select></label><label>Initial password<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="primary">Create account →</button></form></div><div class="help-card"><h2>Change your password</h2><p>Use a unique password with at least 12 characters.</p><form id="password-form"><label>Current password<input name="current" type="password" required autocomplete="current-password"></label><label>New password<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="secondary">Update password</button></form></div></div>`;
+  $('#user-form').onsubmit=e=>{e.preventDefault();guarded(async()=>{await api('create-user',Object.fromEntries(new FormData(e.target)));await teamView();toast('Account created. Share its initial password securely.');});};$('#password-form').onsubmit=e=>{e.preventDefault();guarded(async()=>{await api('password',Object.fromEntries(new FormData(e.target)));e.target.reset();toast('Password changed.');});};
+  document.querySelectorAll('[data-user]').forEach(b=>b.onclick=()=>guarded(async()=>{const u=users.find(x=>x.id===b.dataset.user);if(!await confirmAction(`${u.active?'Disable':'Enable'} this account?`,`${u.name} will ${u.active?'lose':'regain'} dashboard access. Their existing edits remain in history.`))return;await api('toggle-user',{id:u.id});await teamView();}));
+}
+function helpView(){
+  $('#content').innerHTML=head('A SMALL LEARNING CURVE','You do not need VS Code.','A straightforward editing workflow, with review and recovery built in.')+localNotice()+`<div class="help-grid"><div class="help-card"><h2>Update a page</h2><ol><li>Choose <strong>Website pages</strong> and open the page.</li><li>Click text or an image in the preview, or search its fields.</li><li>Type the corrected wording, link, caption or figure.</li><li>Choose <strong>Save draft</strong>, then <strong>Preview draft</strong>.</li><li>An administrator reviews and publishes the page.</li></ol><p>Changes affect the selected page only. Review repeated figures or wording on other pages separately.</p></div><div class="help-card"><h2>Add approved photographs</h2><ol><li>Upload an image in <strong>Media library</strong>.</li><li>Add its description and credit; confirm publication permission.</li><li>Open a page and select an image field.</li><li>Choose the image from the library, save and review.</li></ol><p>New uploads are private until a published page references them. No Drive files are modified.</p></div><div class="help-card"><h2>Figures, newsletters & videos</h2><p>Change existing impact labels and animated counter targets deliberately. Counts are not deduplicated or automatically added across programmes.</p><p>Rhythm & Smiles subscriptions and distribution remain with the existing Substack system. This dashboard edits its links; it does not run a mailing list.</p><p>Existing videos are preserved. New embedded videos use approved YouTube/Vimeo links; direct video uploads are not included.</p></div><div class="help-card"><h2>Recover & keep a backup</h2><p>Open <strong>Revision history</strong> to restore earlier content as a draft. Publish it only after checking the preview.</p><p>Download a content backup for the operator. It excludes passwords and session data; the operator must also back up website assets and uploaded images.</p>${state.user.role==='admin'?'<a class="secondary" href="../api.php?action=backup" download>Download content backup ↓</a>':''}</div><div class="help-card"><h2>Derrick’s installation checklist</h2><p>PHP 8.1+ with DOM, Fileinfo and sessions; HTTPS; writable persistent storage outside the public document root. No WordPress or Node server required in production.</p><p>Install on staging first. Reconcile the current WordPress version with the preserved 33-page website before switching the live domain. Follow the supplied <code>INSTALL.md</code>.</p></div><div class="help-card"><h2>What this version does not do</h2><p>This is an editor for the existing website—not a drag-and-drop page builder. Adding new arbitrary sections, automated country reports, deduplicated impact totals, email delivery and Google Drive synchronisation require separate work.</p><p>No hosting, subscription, payment or live publication has been configured by this local build.</p></div></div>`;
+}
+window.addEventListener('message',e=>{
+  if(e.origin!==location.origin||e.source!==$('#site-preview')?.contentWindow||!state.page)return;
+  if(e.data?.type==='AOL_SELECT'){const fields=state.page.fields.filter(f=>f.node===e.data.node);const field=fields.find(f=>f.kind==='image')||fields.find(f=>f.kind==='text')||fields[0];if(field)selectField(field.id);}
+  if(e.data?.type==='AOL_READY')$('#site-preview').contentWindow.postMessage({type:'AOL_PATCH',fields:state.page.fields.map(f=>({...f,value:fieldValue(f)}))},location.origin);
+});
+window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue='';}});
+window.addEventListener('hashchange',()=>guarded(route));
+window.addEventListener('resize',()=>{if(window.innerWidth>650&&state.view==='edit'){$('#editor-panel').hidden=false;$('#preview-panel').hidden=false;}});
+$('#media-close').onclick=()=>$('#media-dialog').close();
+$('#auth-form').onsubmit=async e=>{e.preventDefault();$('#auth-error').textContent='';const button=$('#auth-submit');button.disabled=true;try{await api(e.target.dataset.action,Object.fromEntries(new FormData(e.target)));e.target.reset();await boot();}catch(error){$('#auth-error').textContent=error.message;}finally{button.disabled=false;}};
+$('#local-enter').onclick=()=>guarded(async()=>{await api('local-session',{});await boot();});
+$('#logout').onclick=()=>guarded(async()=>{if(state.dirty&&!await confirmAction('Sign out with unsaved edits?','These changes have not been saved.','Sign out'))return;state.dirty=false;await api('logout',{});location.hash='overview';await boot();});
+guarded(boot);
